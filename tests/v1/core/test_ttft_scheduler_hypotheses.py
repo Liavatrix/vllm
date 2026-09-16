@@ -10,12 +10,28 @@ from vllm.experimental.ttft_schedulers import (
     NaivePrefillReserveScheduler,
     TokenTimeAwareScheduler,
 )
+from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import RequestStatus
 
 from .utils import create_requests, create_scheduler
 
 pytestmark = pytest.mark.skip_global_cleanup
+
+
+class _AbsoluteInFlightPriorityScheduler(AsyncScheduler):
+    """Test-only counterfactual that moves pre-first in-flight work first."""
+
+    def schedule(self, throttle_prefills: bool = False):
+        priority = [
+            request
+            for request in self.running
+            if request.num_in_flight_tokens > 0 and request.num_output_tokens == 0
+        ]
+        self.running = priority + [
+            request for request in self.running if request not in priority
+        ]
+        return super().schedule(throttle_prefills)
 
 
 def _add_decode(scheduler, request_id: str) -> None:
@@ -208,3 +224,56 @@ def test_candidate_5_kv_failure_blocks_admission_despite_token_capacity(monkeypa
     assert _scheduled_counts(output) == (128, 0, 0)
     assert 2048 - sum(output.num_scheduled_tokens.values()) == 1920
     assert scheduler.ttft_debug_stats.waiting_admission_blocked_by_kv_cache == 1
+
+
+def test_absolute_inflight_priority_cannot_accelerate_first_output():
+    def trace(scheduler_cls):
+        scheduler = create_scheduler(
+            max_num_batched_tokens=2048,
+            max_num_seqs=128,
+            scheduler_cls=scheduler_cls,
+        )
+        target = _add_old_prefill(scheduler, request_id="target")
+        prefill_output = scheduler.schedule()
+        for index in range(127):
+            _add_decode(scheduler, f"decode-{index}")
+        scheduler.running = [
+            request for request in scheduler.running if request.request_id != "target"
+        ] + [target]
+
+        second_output = scheduler.schedule()
+        before_output = (
+            target.status,
+            target.num_computed_tokens,
+            target.num_in_flight_tokens,
+            target.num_output_tokens,
+            second_output.num_scheduled_tokens[target.request_id],
+        )
+        scheduler.update_from_output(
+            prefill_output,
+            ModelRunnerOutput(
+                req_ids=[target.request_id],
+                req_id_to_index={target.request_id: 0},
+                sampled_token_ids=[[1]],
+            ),
+        )
+        after_output = (
+            target.num_in_flight_tokens,
+            target.num_output_tokens,
+        )
+        return (
+            tuple(second_output.num_scheduled_tokens),
+            _scheduled_counts(second_output),
+            before_output,
+            after_output,
+        )
+
+    stock = trace(AsyncScheduler)
+    absolute_priority = trace(_AbsoluteInFlightPriorityScheduler)
+
+    assert stock[0][-1] == "target"
+    assert absolute_priority[0][0] == "target"
+    assert stock[1:] == absolute_priority[1:]
+    assert stock[1] == (127, 0, 0)
+    assert stock[2] == (RequestStatus.RUNNING, 257, 257, 0, 1)
+    assert stock[3] == (1, 1)
