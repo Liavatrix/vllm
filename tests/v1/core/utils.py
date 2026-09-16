@@ -76,6 +76,7 @@ def create_scheduler(
     kv_cache_spec: KVCacheSpec | None = None,
     per_request_spec_decode_metrics: str = "none",
     scheduling_policy: SchedulerPolicy = "fcfs",
+    scheduler_cls: type[Scheduler] | None = None,
 ) -> Scheduler | AsyncScheduler:
     """Create scheduler under test.
 
@@ -204,8 +205,10 @@ def create_scheduler(
     )
     cache_config.num_gpu_blocks = num_blocks
     register_all_kvcache_specs(vllm_config)
-    scheduler_cls = AsyncScheduler if async_scheduling else Scheduler
-    scheduler = scheduler_cls(
+    scheduler_class = scheduler_cls or (
+        AsyncScheduler if async_scheduling else Scheduler
+    )
+    scheduler = scheduler_class(
         vllm_config=vllm_config,
         kv_cache_config=kv_cache_config,
         block_size=block_size,
