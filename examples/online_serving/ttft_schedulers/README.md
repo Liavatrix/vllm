@@ -8,11 +8,11 @@ with `--scheduler-cls` and preserve async scheduling by subclassing
 | Policy | Scheduler class | Behavior |
 | --- | --- | --- |
 | Naive reserve | `NaivePrefillReserveScheduler` | Caps RUNNING work so a fixed share of the iteration is left for new prefills. |
-| Token-time aware | `TokenTimeAwareScheduler` | When a new request has waited at least the threshold, schedules no RUNNING work that iteration, allowing WAITING prefills to use the budget. |
+| Token-time aware | `TokenTimeAwareScheduler` | When a pre-first-token request has waited at least the threshold, reserves targeted capacity for the oldest queued prefill while retaining a decode floor. |
 
-The policies intentionally affect only requests in `WAITING` with zero computed
-tokens. A preempted request is not considered a TTFT candidate because it has
-already received its first token.
+Both policies consider queued requests that have no generated output token.
+The time-aware policy separately observes partially computed prefills that have
+not yet produced an output token; it does not bypass vLLM's sequence limit.
 
 ## RunPod pod workflow
 
@@ -49,8 +49,12 @@ VLLM_PREFILL_RESERVE_TOKENS=512 \
   bash examples/online_serving/ttft_schedulers/serve.sh naive <QWEN_MODEL> \
   --max-num-batched-tokens 2048 <your-existing-vllm-options>
 
-# At 0.75 seconds, an overdue new prefill gets the next iteration's token budget.
+# At 0.75 seconds, reserve up to 512 tokens for the oldest overdue queued
+# prefill, while preserving a 512-token decode floor. For 256-token prompts,
+# the targeted reserve is 256 tokens.
 VLLM_TTFT_WAIT_THRESHOLD_S=0.75 \
+VLLM_TTFT_RESCUE_MAX_TOKENS=512 \
+VLLM_TTFT_DECODE_FLOOR_TOKENS=512 \
   bash examples/online_serving/ttft_schedulers/serve.sh time-aware <QWEN_MODEL> \
   --max-num-batched-tokens 2048 <your-existing-vllm-options>
 ```
@@ -63,10 +67,12 @@ vllm bench serve --base-url http://127.0.0.1:8000 \
   <your-existing-benchmark-options>
 ```
 
-For the time-aware policy, every iteration containing an overdue new prefill is
-prefill-first; it is deliberately a hard latency guard rather than a soft
-priority hint. Under sustained overload this can increase decode latency, so
-evaluate p99 TTFT and p99 TPOT together against the same C128 workload.
+Set `VLLM_TTFT_DEBUG=1` to log the configuration once and a structured counter
+snapshot every `VLLM_TTFT_DEBUG_INTERVAL` scheduler iterations (default 1000).
+The snapshot separates guard activation, sequence/KV/token admission blocks,
+prefill tokens scheduled versus returned from execution, and first-output
+completion. Under sustained overload, evaluate p99 TTFT and p99 TPOT together
+against the same C128 workload.
 
 Verify the pod after model loading:
 

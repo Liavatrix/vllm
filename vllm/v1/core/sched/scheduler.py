@@ -506,6 +506,15 @@ class Scheduler(SchedulerInterface):
         """
         return token_budget
 
+    def _on_waiting_schedule_start(self, token_budget: int) -> None:
+        """Observe the token budget available before WAITING scheduling begins."""
+
+    def _on_waiting_admission_blocked_by_seq_cap(self, token_budget: int) -> None:
+        """Observe a WAITING admission blocked by the sequence limit."""
+
+    def _on_waiting_admission_blocked_by_kv_cache(self, request: Request) -> None:
+        """Observe a WAITING admission blocked by KV-cache allocation."""
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
@@ -786,6 +795,7 @@ class Scheduler(SchedulerInterface):
 
         # Next, schedule the WAITING requests.
         if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
+            self._on_waiting_schedule_start(token_budget)
             step_skipped_waiting = create_request_queue(self.policy)
 
             while (self.waiting or self.skipped_waiting) and token_budget > 0:
@@ -795,6 +805,7 @@ class Scheduler(SchedulerInterface):
                 # in `running` but still hold a model-runner request slot.
                 num_running = len(self.running) + self.num_waiting_for_streaming_input
                 if num_running >= self.max_num_running_reqs:
+                    self._on_waiting_admission_blocked_by_seq_cap(token_budget)
                     break
 
                 request_queue = self._select_waiting_queue_for_scheduling()
@@ -1103,6 +1114,8 @@ class Scheduler(SchedulerInterface):
 
                 if new_blocks is None:
                     # The request cannot be scheduled.
+
+                    self._on_waiting_admission_blocked_by_kv_cache(request)
 
                     # NOTE: we need to untouch the request from the encode cache
                     # manager
