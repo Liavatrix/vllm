@@ -498,6 +498,14 @@ class Scheduler(SchedulerInterface):
             num_new_tokens -= self.num_prefill_lookahead - remaining
         return max(num_new_tokens, 0)
 
+    def _get_running_token_budget(self, token_budget: int) -> int:
+        """Return the portion of an iteration budget available to RUNNING requests.
+
+        Custom schedulers can reserve the remaining tokens for WAITING requests.
+        The default preserves the decode-first scheduling behavior.
+        """
+        return token_budget
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
@@ -525,6 +533,7 @@ class Scheduler(SchedulerInterface):
         if self._pause_state == PauseState.PAUSED_ALL:
             # Do not schedule any requests when paused.
             token_budget = 0
+        running_token_budget = self._get_running_token_budget(token_budget)
 
         # Encoder-related.
         scheduled_encoder_inputs: dict[str, list[int]] = {}
@@ -549,7 +558,7 @@ class Scheduler(SchedulerInterface):
 
         # First, schedule the RUNNING requests.
         req_index = 0
-        while req_index < len(self.running) and token_budget > 0:
+        while req_index < len(self.running) and running_token_budget > 0:
             request = self.running[req_index]
             if input_budget <= draft_slots:
                 break
@@ -590,7 +599,9 @@ class Scheduler(SchedulerInterface):
             if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
             num_new_tokens = min(
-                num_new_tokens, token_budget, input_budget - draft_slots
+                num_new_tokens,
+                running_token_budget,
+                input_budget - draft_slots,
             )
 
             # Make sure the input position does not exceed the max model len.
@@ -687,6 +698,7 @@ class Scheduler(SchedulerInterface):
                             scheduled_running_reqs.remove(preempted_req)
                             restored = num_scheduled_tokens.pop(preempted_req_id)
                             token_budget += restored
+                            running_token_budget += restored
                             input_budget += restored + draft_slots
                             req_to_new_blocks.pop(preempted_req_id)
                             scheduled_spec_decode_tokens.pop(preempted_req_id, None)
@@ -725,6 +737,7 @@ class Scheduler(SchedulerInterface):
             req_to_new_blocks[request_id] = new_blocks
             num_scheduled_tokens[request_id] = num_new_tokens
             token_budget -= num_new_tokens
+            running_token_budget -= num_new_tokens
             input_budget -= num_new_tokens + draft_slots
             req_index += 1
 
